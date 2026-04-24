@@ -1,7 +1,7 @@
 # WeCom-RAGFLOW-Bridge
 
 企业微信智能机器人 ↔ RAGFLOW 桥接服务。
-
+本服务基于https://github.com/ApakohZzz/wecom-dify-bridge 的基础上做的RagFlow 桥接服务的改造，感谢大佬的支持
 通过 **WebSocket 长连接** 方式对接企业微信智能机器人，将用户消息转发到 RAGFLOW 应用，并将 AI 回复实时返回给用户。
 
 ## 为什么需要这个服务？
