@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  wecom-RAGFLOW-bridge:
+    build: .
+    container_name: wecom-ragflow-bridge
+    image: wecom-ragflow-bridge:latest
+    restart: unless-stopped
+    # 连接到 RAGFLOW 的 Docker 网络，以便通过内部网络访问 RAGFLOW API
+    networks:
+      - ragflow-network
+      - default
+
+networks:
+  ragflow-network:
+    external: true
+    name: docker_ragflow  # RAGFLOW docker-compose 默认创建的网络名
