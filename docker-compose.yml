@@ -5,7 +5,9 @@ services:
     build: .
     container_name: wecom-ragflow-bridge
     image: wecom-ragflow-bridge:latest
-    restart: unless-stopped
+    #restart: unless-stopped
+    volumes:
+      - ./.config:/opt/app/config  # 将本地 config 目录挂载到容器内
     # 连接到 RAGFLOW 的 Docker 网络，以便通过内部网络访问 RAGFLOW API
     networks:
       - ragflow-network

@@ -30,7 +30,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("wecom-RAGFLOW-bridge")
-
+logger.setLevel(logging.DEBUG)  # 默认日志级别为 INFO，调试时可改为 DEBUG
 
 class WeComRAGFLOWBridge:
     """企业微信长连接 <-> RAGFLOW 桥接器"""
