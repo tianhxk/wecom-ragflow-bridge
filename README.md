@@ -35,7 +35,7 @@ RAGFLOW 应用
 
 ## 前置条件
 
-- 已部署 [RAGFLOW](https://github.com/langgenius/RAGFLOW) 并创建了一个**聊天助手**或 **Chatflow** 应用
+- 已部署 [RAGFLOW](https://github.com/infiniflow/ragflow) 并创建了一个**聊天助手**或 **Chatflow** 应用
 - 企业微信管理后台已创建**智能机器人**并开启 **API 长连接模式**
 
 ## 快速部署
@@ -43,7 +43,7 @@ RAGFLOW 应用
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/ApakohZzz/wecom-RAGFLOW-bridge.git
+git clone https://github.com/tianhxk/wecom-ragflow-bridge.git
 cd wecom-RAGFLOW-bridge
 ```
 
@@ -60,6 +60,7 @@ cp .env.example .env
 | `WECOM_BOT_ID` | ✅ | 机器人 BotID | 企业微信后台 → 应用管理 → 智能机器人 → API 模式 |
 | `WECOM_SECRET` | ✅ | 长连接 Secret | 同上 |
 | `RAGFLOW_API_KEY` | ✅ | RAGFLOW 应用 API Key（`app-` 开头） | RAGFLOW 控制台 → 你的应用 → API 访问 |
+| `RAGFLOW_AGENT_ID` | ✅ | RAGFLOW 应用  | RAGFLOW 应用的 API Key（在 RAGFLOW 控制台 -> agent应用 -> 具体的智能体-右上角-管理-嵌入网站中获得 访问 中获取） |
 | `RAGFLOW_API_BASE` | ❌ | RAGFLOW API 地址 | 默认 `http://nginx/v1`（与 RAGFLOW 同机部署时） |
 | `STREAM_MODE` | ❌ | 流式回复开关 | 默认 `true` |
 | `HEARTBEAT_INTERVAL` | ❌ | 心跳间隔（秒） | 默认 `30` |
