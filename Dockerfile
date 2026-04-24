@@ -6,6 +6,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
-COPY data/.env ./data/.env
+COPY config/.env ./config/.env
 
 CMD ["python", "-u", "src/main.py"]

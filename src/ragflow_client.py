@@ -41,7 +41,7 @@ class RAGFLOWClient:
 
             async for line in resp.content:
                 line = line.decode("utf-8").strip()
-                if not line.startswith("data:"):
+                if not line.startswith(":"):
                     continue
 
                 try:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 def _load_env() -> None:
     """从项目根目录的 .env 文件加载环境变量（如果尚未设置）"""
-    env_path = Path.cwd() / "data" / ".env"
+    env_path = Path.cwd() / "config" / ".env"
     if not env_path.exists():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():
