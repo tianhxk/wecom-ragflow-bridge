@@ -21,6 +21,7 @@ from config import Config
 from protocol import WeComCmd, WeComEvent, MessageBuilder
 from session import SessionManager
 from ragflow_client import RAGFLOWClient
+from wecom_api import WeComAPIClient
 from animation import animate_waiting
 
 # ============ 日志 ============
@@ -30,7 +31,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("wecom-RAGFLOW-bridge")
-logger.setLevel(logging.DEBUG)  # 默认日志级别为 INFO，调试时可改为 DEBUG
+#logger.setLevel(logging.DEBUG)  # 默认日志级别为 INFO，调试时可改为 DEBUG
 
 class WeComRAGFLOWBridge:
     """企业微信长连接 <-> RAGFLOW 桥接器"""
@@ -42,6 +43,7 @@ class WeComRAGFLOWBridge:
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._sessions = SessionManager()
         self._ragflow: Optional[RAGFLOWClient] = None
+        self._wecom_api: Optional[WeComAPIClient] = None
 
     async def start(self):
         """启动桥接服务"""
@@ -52,6 +54,12 @@ class WeComRAGFLOWBridge:
             self._config.ragflow_api_base,
             self._config.ragflow_api_key,
             self._config.ragflow_agent_id
+        )
+        self._wecom_api = WeComAPIClient(
+            self._http_session,
+            self._config.wecom_corp_id,
+            self._config.wecom_bot_id,
+            self._config.wecom_secret
         )
 
         while self._running:
@@ -185,12 +193,12 @@ class WeComRAGFLOWBridge:
         msg_type = body.get("msgtype", "")
         user_id = body.get("from", {}).get("userid", "unknown")
 
-        user_message = self._extract_message(body, msg_type)
-        if not user_message:
+        user_message, image_data = await self._extract_message(body, msg_type)
+        if not user_message and not image_data:
             logger.warning(f"无法提取消息内容: msg_type={msg_type}")
             return
 
-        logger.info(f"用户消息: user={user_id}, chat={chat_id}, msg={user_message[:100]}")
+        logger.info(f"用户消息: user={user_id}, chat={chat_id}, msg={user_message[:100] if user_message else '[图片]'}, 含图片={image_data is not None}")
 
         if user_message.strip() == "#reset":
             old_conv = self._sessions.clear_conversation(chat_id)
@@ -205,31 +213,53 @@ class WeComRAGFLOWBridge:
 
         try:
             if self._config.stream_mode:
-                await self._reply_stream(req_id, chat_id, user_message)
+                await self._reply_stream(req_id, chat_id, user_message, image_data)
             else:
-                await self._reply_blocking(req_id, chat_id, user_id, user_message)
+                await self._reply_blocking(req_id, chat_id, user_id, user_message, image_data)
         except Exception as e:
             logger.error(f"回复消息失败: {e}", exc_info=True)
             msg = MessageBuilder.build_error(req_id)
             await self._ws.send(json.dumps(msg))
 
-    def _extract_message(self, body: dict, msg_type: str) -> str:
-        """提取用户消息文本"""
+    async def _extract_message(self, body: dict, msg_type: str) -> tuple[str, Optional[bytes]]:
+        """提取用户消息文本和图片数据"""
         if msg_type == "text":
-            return body.get("text", {}).get("content", "").strip()
+            return body.get("text", {}).get("content", "").strip(), None
         if msg_type == "mixed":
             items = body.get("mixed", {}).get("item", [])
-            texts = [item.get("text", {}).get("content", "") for item in items if item.get("msgtype") == "text"]
-            return " ".join(texts).strip()
+            texts = []
+            image_data = None
+            for item in items:
+                item_type = item.get("msgtype", "")
+                if item_type == "text":
+                    content = item.get("text", {}).get("content", "")
+                    if content:
+                        texts.append(content)
+                elif item_type == "image" and image_data is None:
+                    media_id = item.get("image", {}).get("media_id")
+                    if media_id:
+                        try:
+                            image_data = await self._wecom_api.download_media(media_id)
+                        except Exception as e:
+                            logger.error(f"下载 mixed 中的图片失败: {e}")
+            return " ".join(texts).strip(), image_data
         if msg_type == "voice":
-            return "[语音消息] 暂不支持语音识别，请发送文字消息。"
+            return "[语音消息] 暂不支持语音识别，请发送文字消息。", None
         if msg_type == "image":
-            return "[图片消息]"
+            media_id = body.get("image", {}).get("media_id")
+            if media_id:
+                try:
+                    image_data = await self._wecom_api.download_media(media_id)
+                    return "[图片消息]", image_data
+                except Exception as e:
+                    logger.error(f"下载图片失败: {e}")
+                    return "[图片消息] 下载图片失败", None
+            return "[图片消息] 无媒体ID", None
         if msg_type == "file":
-            return "[文件消息]"
-        return ""
+            return "[文件消息]", None
+        return "", None
 
-    async def _reply_stream(self, req_id: str, chat_id: str, message: str):
+    async def _reply_stream(self, req_id: str, chat_id: str, message: str, image_data: Optional[bytes] = None):
         """流式回复"""
         stream_id = uuid.uuid4().hex[:16]
         accumulated_text = ""
@@ -241,7 +271,7 @@ class WeComRAGFLOWBridge:
         await self._ws.send(json.dumps(msg))
 
         try:
-            async for event_data in self._ragflow.chat_stream(message):
+            async for event_data in self._ragflow.chat_stream(message, image_data):
                 if event_data == "[DONE]":
                     break
 
@@ -274,13 +304,13 @@ class WeComRAGFLOWBridge:
                 pass
 
         if not accumulated_text:
-            accumulated_text = "抱歉，我暂时无法回答这个问题。"
+            accumulated_text = "流式处理未返回结果"
 
         msg = MessageBuilder.build_stream_message(req_id, stream_id, accumulated_text, finish=True)
         await self._ws.send(json.dumps(msg))
         logger.info(f"流式回复完成: stream_id={stream_id}, 长度={len(accumulated_text)}")
 
-    async def _reply_blocking(self, req_id: str, chat_id: str, user_id: str, message: str):
+    async def _reply_blocking(self, req_id: str, chat_id: str, user_id: str, message: str, image_data: Optional[bytes] = None):
         """阻塞式回复"""
         conv_id = self._sessions.get_conversation_id(chat_id)
         answer, new_conv_id = await self._ragflow.chat_blocking(message, user_id, conv_id)

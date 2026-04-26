@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/main.py src/ragflow_client.py src/wecom_api.py src/config.py)",
+      "Bash(python -m py_compile src/main.py src/wecom_api.py src/config.py)"
+    ]
+  }
+}

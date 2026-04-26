@@ -35,6 +35,7 @@ class Config:
     """应用配置"""
     wecom_bot_id: str = field(default_factory=lambda: os.environ.get("WECOM_BOT_ID", ""))
     wecom_secret: str = field(default_factory=lambda: os.environ.get("WECOM_SECRET", ""))
+    wecom_corp_id: str = field(default_factory=lambda: os.environ.get("WECOM_CORP_ID", ""))
     wecom_ws_url: str = field(default_factory=lambda: os.environ.get("WECOM_WS_URL", "wss://openws.work.weixin.qq.com"))
     ragflow_api_base: str = field(default_factory=lambda: os.environ.get("RAGFLOW_API_BASE", "http://localhost/v1"))
     ragflow_api_key: str = field(default_factory=lambda: os.environ.get("RAGFLOW_API_KEY", ""))
@@ -43,9 +44,10 @@ class Config:
     stream_mode: bool = field(default_factory=lambda: os.environ.get("STREAM_MODE", "true").lower() == "true")
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())
     def __post_init__(self) -> None:
-        logger.info("wecom_bot_id: %s", self.wecom_bot_id[:8])
-        logger.info("wecom_secret: %s", self.wecom_secret[:8])
-        logger.info("ragflow_api_key: %s", self.ragflow_api_key[:8])
+        logger.info("wecom_bot_id: %s", self.wecom_bot_id[:8] if self.wecom_bot_id else "empty")
+        logger.info("wecom_secret: %s", self.wecom_secret[:8] if self.wecom_secret else "empty")
+        logger.info("wecom_corp_id: %s", self.wecom_corp_id[:8] if self.wecom_corp_id else "empty")
+        logger.info("ragflow_api_key: %s", self.ragflow_api_key[:8] if self.ragflow_api_key else "empty")
 
     def validate(self) -> list[str]:
         """验证必填配置，返回错误列表"""
@@ -56,4 +58,6 @@ class Config:
             errors.append("缺少环境变量 WECOM_SECRET")
         if not self.ragflow_api_key:
             errors.append("缺少环境变量 RAGFLOW_API_KEY")
+        if not self.wecom_corp_id:
+            errors.append("缺少环境变量 WECOM_CORP_ID（用于图片识别）")
         return errors
