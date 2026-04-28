@@ -6,22 +6,27 @@
 """
 
 import asyncio
+import base64
 import json
 import logging
 import signal
 import sys
 import platform
+import time
 import uuid
 from typing import Optional
 
 import aiohttp
 import websockets
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 from config import Config
 from protocol import WeComCmd, WeComEvent, MessageBuilder
 from session import SessionManager
 from ragflow_client import RAGFLOWClient
 from wecom_api import WeComAPIClient
+from mineru_client import MinerUClient
 from animation import animate_waiting
 
 # ============ 日志 ============
@@ -44,6 +49,7 @@ class WeComRAGFLOWBridge:
         self._sessions = SessionManager()
         self._ragflow: Optional[RAGFLOWClient] = None
         self._wecom_api: Optional[WeComAPIClient] = None
+        self._mineru: Optional[MinerUClient] = None
 
     async def start(self):
         """启动桥接服务"""
@@ -61,6 +67,16 @@ class WeComRAGFLOWBridge:
             self._config.wecom_bot_id,
             self._config.wecom_secret
         )
+        if self._config.mineru_api_key:
+            self._mineru = MinerUClient(
+                self._http_session,
+                self._config.mineru_api_base,
+                self._config.mineru_api_key,
+                self._config.mineru_ocr_method
+            )
+        else:
+            self._mineru = None
+            logger.warning("未配置 MINERU_API_KEY，图片 OCR 识别将不可用")
 
         while self._running:
             try:
@@ -193,12 +209,24 @@ class WeComRAGFLOWBridge:
         msg_type = body.get("msgtype", "")
         user_id = body.get("from", {}).get("userid", "unknown")
 
-        user_message, image_data = await self._extract_message(body, msg_type)
+        start_time = time.time()
+        status_code, user_message, image_data = await self._extract_message(body, msg_type)
+        elapsed = (time.time() - start_time) * 1000
+        logger.info(f"_extract_message 耗时: {elapsed:.2f}ms")
+        if status_code != 0:
+            logger.warning(f"消息提取失败: msg_type={msg_type}")
+            return
+
         if not user_message and not image_data:
-            logger.warning(f"无法提取消息内容: msg_type={msg_type}")
+            logger.warning(f"消息内容为空: msg_type={msg_type}")
             return
 
         logger.info(f"用户消息: user={user_id}, chat={chat_id}, msg={user_message[:100] if user_message else '[图片]'}, 含图片={image_data is not None}")
+        if msg_type in ["mixed", "image"]:
+           msg= MessageBuilder.build_stream_message(
+               req_id, uuid.uuid4().hex[:16],
+                 f"通过图片解析,您提问的问题是：{user_message}")
+           await self._ws.send(json.dumps(msg))
 
         if user_message.strip() == "#reset":
             old_conv = self._sessions.clear_conversation(chat_id)
@@ -221,43 +249,143 @@ class WeComRAGFLOWBridge:
             msg = MessageBuilder.build_error(req_id)
             await self._ws.send(json.dumps(msg))
 
-    async def _extract_message(self, body: dict, msg_type: str) -> tuple[str, Optional[bytes]]:
-        """提取用户消息文本和图片数据"""
+    async def _decrypt_wecom_image(self, image_info: dict) -> Optional[tuple[str, bytes]]:
+        """解密企业微信机器人图片并保存到本地媒体目录
+
+        Returns:
+            (filename, image_data) 或 None（解密/保存失败时）
+        """
+        image_url = image_info.get("url")
+        aeskey = image_info.get("aeskey")
+        if not image_url or not aeskey:
+            logger.warning("图片信息缺少 url 或 aeskey")
+            return None
+        try:
+            # 下载加密图片
+            async with self._http_session.get(image_url) as resp:
+                if resp.status != 200:
+                    logger.error(f"下载加密图片失败: HTTP {resp.status}, URL: {image_url}")
+                    return None
+                cipher_data = await resp.read()
+            # 解密
+            aeskey = aeskey.replace("-", "+").replace("_", "/")
+            padding = 4 - len(aeskey) % 4
+            if padding != 4:
+                aeskey += "=" * padding
+            key = base64.b64decode(aeskey)
+            iv = key[:16]
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            image_data = unpad(cipher.decrypt(cipher_data), AES.block_size)
+
+            # 保存到本地媒体目录
+            from urllib.parse import urlparse
+            import os
+            import tempfile
+            from pathlib import Path
+            parsed = urlparse(image_url)
+            ext = os.path.splitext(parsed.path)[1] if parsed.path else ""
+            if not ext:
+                ext = ".jpeg"
+            if not ext.startswith("."):
+                ext = "." + ext
+            media_dir = os.environ.get("MEDIA_DIR", tempfile.gettempdir())
+            Path(media_dir).mkdir(parents=True, exist_ok=True)
+            filename = f"mineru_{os.urandom(8).hex()}{ext}"
+            local_path = os.path.join(media_dir, filename)
+            with open(local_path, "wb") as f:
+                f.write(image_data)
+
+            logger.info(f"解密并保存图片: {local_path}, 大小: {len(image_data)} bytes")
+            return local_path, image_data
+        except Exception as e:
+            logger.error(f"解密图片失败: {e}, URL: {image_url}")
+            return None
+
+    async def _cleanup_media_file(self, filename: str, max_age_days: int = 3) -> None:
+        """清理媒体目录中指定天数之前的临时文件
+
+        Args:
+            filename: 要清理的文件名
+            max_age_days: 仅清理超过此天数的文件，默认3天
+        """
+        import os
+        import tempfile
+        import time
+        media_dir = os.environ.get("MEDIA_DIR", tempfile.gettempdir())
+        local_path = os.path.join(media_dir, filename)
+        try:
+            if os.path.exists(local_path):
+                file_mtime = os.path.getmtime(local_path)
+                file_age_days = (time.time() - file_mtime) / 86400
+                if file_age_days >= max_age_days:
+                    os.remove(local_path)
+                    logger.debug(f"已清理过期临时文件: {local_path} (年龄: {file_age_days:.1f}天)")
+                else:
+                    logger.debug(f"临时文件未过期保留: {local_path} (年龄: {file_age_days:.1f}天)")
+        except Exception as e:
+            logger.warning(f"清理临时文件失败: {e}")
+
+    async def _ocr_image(self, image_info: dict) -> Optional[str]:
+        """使用 MinerU OCR 识别图片内容（支持加密图片）"""
+        if not self._mineru:
+            return None
+        try:
+            image_url = image_info.get("url", "")
+          
+            # file 模式：解密后直接传二进制数据给 MinerU
+            result = await self._decrypt_wecom_image(image_info)
+            if not result:
+                logger.error("图片解密失败，无法进行 OCR")
+                return None
+            filename, image_data = result   #filename包含全文件路径
+            try:
+                logger.info(f"开始 OCR 识别图片, 方式: file, 大小: {len(image_data)} bytes")
+                text = await self._mineru.ocr(image_url, image_data, filename)
+            finally:
+                await self._cleanup_media_file(filename)
+            
+            logger.info(f"OCR 识别完成，提取文字长度: {len(text) if text else 0}")
+            return text if text and text.strip() else None
+        except Exception as e:
+            logger.error(f"OCR 识别失败: {e}")
+            return None
+
+    async def _extract_message(self, body: dict, msg_type: str) -> tuple[int, str, Optional[bytes]]:
+        """提取用户消息文本和图片数据（图片会通过 MinerU OCR 识别）
+        返回 (状态码, 消息文本, 图片数据)
+        状态码: 0=成功, 1=失败
+        """
         if msg_type == "text":
-            return body.get("text", {}).get("content", "").strip(), None
+            return 0, body.get("text", {}).get("content", "").strip(), None
         if msg_type == "mixed":
-            items = body.get("mixed", {}).get("item", [])
+            items = body.get("mixed", {}).get("msg_item", [])
             texts = []
-            image_data = None
+            image_info = None
             for item in items:
                 item_type = item.get("msgtype", "")
                 if item_type == "text":
                     content = item.get("text", {}).get("content", "")
                     if content:
                         texts.append(content)
-                elif item_type == "image" and image_data is None:
-                    media_id = item.get("image", {}).get("media_id")
-                    if media_id:
-                        try:
-                            image_data = await self._wecom_api.download_media(media_id)
-                        except Exception as e:
-                            logger.error(f"下载 mixed 中的图片失败: {e}")
-            return " ".join(texts).strip(), image_data
+                elif item_type == "image" :
+                    image_info = item.get("image", {})
+                    if image_info:
+                        ocr_text = await self._ocr_image(image_info)
+                        if ocr_text:
+                            texts.append(f"{ocr_text}")
+            return 0, " ".join(texts).strip(), None
         if msg_type == "voice":
-            return "[语音消息] 暂不支持语音识别，请发送文字消息。", None
+            return 1, "[语音消息] 暂不支持语音识别，请发送文字消息。", None
         if msg_type == "image":
-            media_id = body.get("image", {}).get("media_id")
-            if media_id:
-                try:
-                    image_data = await self._wecom_api.download_media(media_id)
-                    return "[图片消息]", image_data
-                except Exception as e:
-                    logger.error(f"下载图片失败: {e}")
-                    return "[图片消息] 下载图片失败", None
-            return "[图片消息] 无媒体ID", None
+            image_info = body.get("image", {})
+            if image_info.get("url"):
+                ocr_text = await self._ocr_image(image_info)
+                if ocr_text:
+                    return 0, ocr_text, None
+            return 1, "[图片消息] OCR 识别失败", None
         if msg_type == "file":
-            return "[文件消息]", None
-        return "", None
+            return 1, "[文件消息]", None
+        return 1, "", None
 
     async def _reply_stream(self, req_id: str, chat_id: str, message: str, image_data: Optional[bytes] = None):
         """流式回复"""

@@ -40,6 +40,9 @@ class Config:
     ragflow_api_base: str = field(default_factory=lambda: os.environ.get("RAGFLOW_API_BASE", "http://localhost/v1"))
     ragflow_api_key: str = field(default_factory=lambda: os.environ.get("RAGFLOW_API_KEY", ""))
     ragflow_agent_id: str = field(default_factory=lambda: os.environ.get("RAGFLOW_AGENT_ID", ""))
+    mineru_api_base: str = field(default_factory=lambda: os.environ.get("MINERU_API_BASE", "https://mineru.net"))
+    mineru_api_key: str = field(default_factory=lambda: os.environ.get("MINERU_API_KEY", ""))
+    mineru_ocr_method: str = field(default_factory=lambda: os.environ.get("MINERU_OCR_METHOD", "file"))  # file / url / batch
     heartbeat_interval: int = field(default_factory=lambda: int(os.environ.get("HEARTBEAT_INTERVAL", "30")))
     stream_mode: bool = field(default_factory=lambda: os.environ.get("STREAM_MODE", "true").lower() == "true")
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -48,6 +51,7 @@ class Config:
         logger.info("wecom_secret: %s", self.wecom_secret[:8] if self.wecom_secret else "empty")
         logger.info("wecom_corp_id: %s", self.wecom_corp_id[:8] if self.wecom_corp_id else "empty")
         logger.info("ragflow_api_key: %s", self.ragflow_api_key[:8] if self.ragflow_api_key else "empty")
+        logger.info("mineru_api_key: %s", self.mineru_api_key[:8] if self.mineru_api_key else "empty")
 
     def validate(self) -> list[str]:
         """验证必填配置，返回错误列表"""

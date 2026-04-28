@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/main.py src/mineru_client.py)"
+    ]
+  }
+}
