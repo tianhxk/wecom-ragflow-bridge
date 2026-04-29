@@ -215,6 +215,10 @@ class WeComRAGFLOWBridge:
         logger.info(f"_extract_message 耗时: {elapsed:.2f}ms")
         if status_code != 0:
             logger.warning(f"消息提取失败: msg_type={msg_type}")
+            msg= MessageBuilder.build_stream_message(
+               req_id, uuid.uuid4().hex[:16],
+                 f"消息解析失败,请联系我们：{user_message}")
+            await self._ws.send(json.dumps(msg))
             return
 
         if not user_message and not image_data:
@@ -275,9 +279,9 @@ class WeComRAGFLOWBridge:
             key = base64.b64decode(aeskey)
             iv = key[:16]
             cipher = AES.new(key, AES.MODE_CBC, iv)
-            image_data = unpad(cipher.decrypt(cipher_data), AES.block_size)
-
-            # 保存到本地媒体目录
+            #20260429 zhuzc _decrypt_wecom_image 修复Padding is incorrect 的错误,去掉unpad，直接返回解密数据，发现企业微信的加密图片并没有使用标准的 PKCS7 填充，而是直接在末尾添加了随机字节，所以无法使用 unpad 正确去除填充，改为直接返回解密后的数据，由 MinerU OCR 识别时再进行处理。
+            #image_data = unpad(cipher.decrypt(cipher_data), AES.block_size)
+            image_data = cipher.decrypt(cipher_data)          # 保存到本地媒体目录
             from urllib.parse import urlparse
             import os
             import tempfile
