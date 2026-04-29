@@ -61,7 +61,11 @@ cp .env.example .env
 | `WECOM_SECRET` | ✅ | 长连接 Secret | 同上 |
 | `RAGFLOW_API_KEY` | ✅ | RAGFLOW 应用 API Key（`app-` 开头） | RAGFLOW 控制台 → 你的应用 → API 访问 |
 | `RAGFLOW_AGENT_ID` | ✅ | RAGFLOW 应用  | RAGFLOW 应用的 API Key（在 RAGFLOW 控制台 -> agent应用 -> 具体的智能体-右上角-管理-嵌入网站中获得 访问 中获取） |
-| `RAGFLOW_API_BASE` | ❌ | RAGFLOW API 地址 | 默认 `http://nginx/v1`（与 RAGFLOW 同机部署时） |
+| `RAGFLOW_API_BASE` | ✅ | RAGFLOW API 地址 | 默认 `http://127.0.0.1/v1`（与 RAGFLOW 同机部署时） |
+| `MINERU_API_BASE` | ❌ | MinerU API 地址（用于图片 OCR 识别） | 默认 `https://mineru.net`（调用云端服务） |
+| `MINERU_API_KEY` | ❌ | MinerU API KEY（用于图片 OCR 识别） | 官网申请token,用于支持V4batch |
+| `MINERU_OCR_METHOD` | ❌ | MinerU OCR 调用模式 | V1parse:  Agent 轻量解析 API，适合单张图片，但是会限流,已支持；V4batch: 使用 v4/batch 接口解析,精准解析 API,需要token,待测试 |
+| `MEDIA_DIR` | ❌ | 企业微信媒体文件保存目录 | 默认 `./config/media` |
 | `STREAM_MODE` | ❌ | 流式回复开关 | 默认 `true` |
 | `HEARTBEAT_INTERVAL` | ❌ | 心跳间隔（秒） | 默认 `30` |
 | `LOG_LEVEL` | ❌ | 日志级别 | 默认 `INFO` |
