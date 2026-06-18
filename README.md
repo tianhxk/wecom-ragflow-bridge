@@ -67,9 +67,18 @@ cp .env.example .env
 |------|------|------|------|
 | `WECOM_BOT_ID` | ✅ | 机器人 BotID | 企业微信后台 → 应用管理 → 智能机器人 → API 模式 |
 | `WECOM_SECRET` | ✅ | 长连接 Secret | 同上 |
+| `WECOM_BOT_ENABLED` | ❌ | 是否启用企业微信智能机器人长连接通道 | 默认 `true` |
 | `RAGFLOW_API_KEY` | ✅ | RAGFLOW 应用 API Key（`app-` 开头） | RAGFLOW 控制台 → 你的应用 → API 访问 |
 | `RAGFLOW_AGENT_ID` | ✅ | RAGFLOW 应用  | RAGFLOW 应用的 API Key（在 RAGFLOW 控制台 -> agent应用 -> 具体的智能体-右上角-管理-嵌入网站中获得 访问 中获取） |
 | `RAGFLOW_API_BASE` | ✅ | RAGFLOW API 地址 | 默认 `http://127.0.0.1/v1`（与 RAGFLOW 同机部署时） |
+| `WECOM_KF_ENABLED` | ❌ | 是否启用微信客服通道 | 默认 `false` |
+| `WECOM_KF_SECRET` | 启用微信客服时必填 | 微信客服 Secret | 企业微信后台 → 微信客服 → API |
+| `WECOM_KF_CALLBACK_TOKEN` | 启用微信客服时必填 | 微信客服回调 Token | 企业微信后台 → 微信客服 → API 接收消息 |
+| `WECOM_KF_ENCODING_AES_KEY` | 启用微信客服时必填 | 微信客服回调 EncodingAESKey | 同上 |
+| `WECOM_KF_OPEN_KFID` | ❌ | 指定客服账号的 `open_kfid`，为空则不限制 | 企业微信后台或客服账号 API |
+| `WECOM_KF_WEBHOOK_HOST` | ❌ | 微信客服 webhook 监听地址 | 默认 `0.0.0.0` |
+| `WECOM_KF_WEBHOOK_PORT` | ❌ | 微信客服 webhook 监听端口 | 默认 `8080` |
+| `WECOM_KF_WEBHOOK_PATH` | ❌ | 微信客服 webhook 路径 | 默认 `/wechat-kf/callback` |
 | `MINERU_API_BASE` | ❌ | MinerU API 地址（用于图片 OCR 识别） | 默认 `https://mineru.net`（调用云端服务） |
 | `MINERU_API_KEY` | ❌ | MinerU API KEY（用于图片 OCR 识别） | 官网申请token,用于支持V4batch |
 | `MINERU_OCR_METHOD` | ❌ | MinerU OCR 调用模式 | V1parse:  Agent 轻量解析 API，适合单张图片，但是会限流,已支持；V4batch: 使用 v4/batch 接口解析,精准解析 API,需要token,待测试 |
@@ -101,6 +110,39 @@ docker compose logs -f
 | 指令 | 说明 |
 |------|------|
 | `#reset` | 清除当前对话历史，开启全新对话 |
+
+## 微信客服接入
+
+微信客服通道与当前企业微信智能机器人长连接通道可以同时开启。开启后，服务会启动一个 webhook 接收微信客服回调，解密回调事件中的 `Token`，再通过微信客服 `sync_msg` 拉取客户消息，复用同一个 RAGFLOW/Dify 聊天后端生成回复，并通过微信客服 `send_msg` 发给客户。
+
+最小配置示例：
+
+```env
+WECOM_KF_ENABLED=true
+WECOM_KF_SECRET=你的微信客服Secret
+WECOM_KF_CALLBACK_TOKEN=你的微信客服回调Token
+WECOM_KF_ENCODING_AES_KEY=你的微信客服回调EncodingAESKey
+WECOM_KF_OPEN_KFID=可选，指定某个客服账号
+WECOM_KF_WEBHOOK_PORT=8080
+WECOM_KF_WEBHOOK_PATH=/wechat-kf/callback
+```
+
+在企业微信后台配置的回调 URL 应指向：
+
+```text
+https://你的域名/wechat-kf/callback
+```
+
+Docker Compose 默认把容器 `8080` 端口映射到宿主机 `8080`。生产环境通常还需要在 Nginx/Caddy/网关上配置 HTTPS 反向代理到 `http://宿主机:8080/wechat-kf/callback`。
+
+如果只想运行微信客服，不运行智能机器人长连接：
+
+```env
+WECOM_BOT_ENABLED=false
+WECOM_KF_ENABLED=true
+```
+
+当前微信客服通道已支持文字消息与 `#reset`，图片和语音会提示用户改发文字。
 
 ## 网络说明
 

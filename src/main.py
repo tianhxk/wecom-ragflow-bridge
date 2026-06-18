@@ -6,9 +6,9 @@
 """
 
 import asyncio
-import base64
 import json
 import logging
+import os
 import signal
 import sys
 import platform
@@ -18,26 +18,27 @@ from typing import Optional
 
 import aiohttp
 import websockets
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 
 from config import Config
 from protocol import WeComCmd, WeComEvent, MessageBuilder
 from session import SessionManager
-from ragflow_client import RAGFLOWClient
+from chat_client import ChatClient, create_chat_client
 from wecom_api import WeComAPIClient
 from mineru_client import MinerUClient
+from media_service import WeComImageService
+from message_extractor import MessageExtractor
+from wechat_kf import WeChatKFBridge, WeChatKFClient
 from animation import animate_waiting
 
 # ============ 日志 ============
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s.%(funcName)s: %(message)s",
     stream=sys.stdout,
 )
 logger = logging.getLogger("wecom-RAGFLOW-bridge")
-#logger.setLevel(logging.DEBUG)  # 默认日志级别为 INFO，调试时可改为 DEBUG
-
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())  # 日志级别从环境变量读取
+logger.info("日志级别设置为: %s", logging.getLevelName(logger.level).lower())
 class WeComRAGFLOWBridge:
     """企业微信长连接 <-> RAGFLOW 桥接器"""
 
@@ -47,20 +48,19 @@ class WeComRAGFLOWBridge:
         self._running = False
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._sessions = SessionManager()
-        self._ragflow: Optional[RAGFLOWClient] = None
+        self._chat_client: Optional[ChatClient] = None
         self._wecom_api: Optional[WeComAPIClient] = None
         self._mineru: Optional[MinerUClient] = None
+        self._message_extractor: Optional[MessageExtractor] = None
+        self._kf_bridge: Optional[WeChatKFBridge] = None
+        self._ws_send_locks: dict[str, asyncio.Lock] = {}
+        self._ws_locks_lock = asyncio.Lock()
 
     async def start(self):
         """启动桥接服务"""
         self._running = True
         self._http_session = aiohttp.ClientSession()
-        self._ragflow = RAGFLOWClient(
-            self._http_session,
-            self._config.ragflow_api_base,
-            self._config.ragflow_api_key,
-            self._config.ragflow_agent_id
-        )
+        self._chat_client = create_chat_client(self._config, self._http_session)
         self._wecom_api = WeComAPIClient(
             self._http_session,
             self._config.wecom_corp_id,
@@ -77,7 +77,45 @@ class WeComRAGFLOWBridge:
         else:
             self._mineru = None
             logger.warning("未配置 MINERU_API_KEY，图片 OCR 识别将不可用")
+        self._message_extractor = MessageExtractor(
+            self._mineru,
+            WeComImageService(self._http_session, self._config.media_dir),
+        )
+        if self._config.wecom_kf_enabled:
+            self._kf_bridge = WeChatKFBridge(
+                WeChatKFClient(
+                    self._http_session,
+                    self._config.wecom_corp_id,
+                    self._config.wecom_kf_secret,
+                ),
+                self._chat_client,
+                self._sessions,
+                self._config.wecom_kf_open_kfid,
+                self._config.wecom_kf_callback_token,
+                self._config.wecom_kf_encoding_aes_key,
+                self._config.wecom_corp_id,
+                self._config.wecom_kf_webhook_host,
+                self._config.wecom_kf_webhook_port,
+                self._config.wecom_kf_webhook_path,
+            )
 
+        tasks = []
+        if self._config.wecom_bot_enabled:
+            tasks.append(asyncio.create_task(self._run_wecom_bot()))
+        if self._kf_bridge:
+            tasks.append(asyncio.create_task(self._kf_bridge.start()))
+
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if self._http_session:
+                await self._http_session.close()
+
+    async def _run_wecom_bot(self):
+        """运行企业微信智能机器人长连接通道。"""
         while self._running:
             try:
                 await self._connect_and_subscribe()
@@ -88,15 +126,26 @@ class WeComRAGFLOWBridge:
                 logger.error(f"连接异常: {e}，10秒后重连...", exc_info=True)
                 await asyncio.sleep(10)
 
-        if self._http_session:
-            await self._http_session.close()
-
     async def stop(self):
         """停止服务"""
         logger.info("正在停止服务...")
         self._running = False
+        if self._kf_bridge:
+            await self._kf_bridge.stop()
         if self._ws:
             await self._ws.close()
+
+    async def safe_ws_send(self, msg: dict):
+        """基于 req_id 的线程安全 WebSocket 发送方法，按请求隔离锁"""
+        req_id = msg.get("headers", {}).get("req_id", "default")
+        async with self._ws_locks_lock:
+            if req_id not in self._ws_send_locks:
+                self._ws_send_locks[req_id] = asyncio.Lock()
+            lock = self._ws_send_locks[req_id]
+
+        async with lock:
+            await self._ws.send(json.dumps(msg))
+            await asyncio.sleep(0.5)  # 小延迟，避免同一请求的消息过快发送导致顺序问题
 
     async def _connect_and_subscribe(self):
         """连接并订阅"""
@@ -130,7 +179,7 @@ class WeComRAGFLOWBridge:
     async def _subscribe(self) -> bool:
         """发送订阅认证请求"""
         msg = MessageBuilder.build_subscribe(self._config.wecom_bot_id, self._config.wecom_secret)
-        await self._ws.send(json.dumps(msg))
+        await self.safe_ws_send(msg)
         logger.debug("已发送订阅请求")
 
         try:
@@ -153,7 +202,7 @@ class WeComRAGFLOWBridge:
             try:
                 await asyncio.sleep(self._config.heartbeat_interval)
                 msg = MessageBuilder.build_ping()
-                await self._ws.send(json.dumps(msg))
+                await self.safe_ws_send(msg)
                 logger.debug("已发送心跳 ping")
             except asyncio.CancelledError:
                 break
@@ -167,8 +216,9 @@ class WeComRAGFLOWBridge:
             try:
                 data = json.loads(raw_message)
                 cmd = data.get("cmd", "")
-                logger.info(f"收到消息: cmd={cmd}")
-                logger.debug(f"消息详情: {json.dumps(data, ensure_ascii=False)[:500]}")
+                if cmd:
+                    logger.info(f" cmd={cmd}")
+                    logger.debug(f"消息详情: {json.dumps(data, ensure_ascii=False)[:500]}")
 
                 if cmd == WeComCmd.MSG_CALLBACK:
                     asyncio.create_task(self._handle_message(data))
@@ -176,8 +226,8 @@ class WeComRAGFLOWBridge:
                     asyncio.create_task(self._handle_event(data))
                 elif cmd == WeComCmd.PONG:
                     logger.debug("收到心跳 pong")
-                else:
-                    logger.debug(f"未处理的命令: {cmd}")
+                #else:
+                #    logger.debug(f"未处理的命令: {cmd},消息详情: {json.dumps(data, ensure_ascii=False)}")
 
             except json.JSONDecodeError:
                 logger.warning(f"无法解析消息: {raw_message[:200]}")
@@ -193,7 +243,7 @@ class WeComRAGFLOWBridge:
         if event_type == WeComEvent.ENTER_CHAT:
             logger.info(f"用户进入会话: chatid={body.get('chatid')}")
             msg = MessageBuilder.build_welcome(req_id, "你好！我是智能助手，有什么可以帮助你的？")
-            await self._ws.send(json.dumps(msg))
+            await self.safe_ws_send(msg)
 
         elif event_type == WeComEvent.DISCONNECTED:
             logger.warning("收到断开连接事件，将尝试重连")
@@ -210,7 +260,7 @@ class WeComRAGFLOWBridge:
         user_id = body.get("from", {}).get("userid", "unknown")
 
         start_time = time.time()
-        status_code, user_message, image_data = await self._extract_message(body, msg_type)
+        status_code, user_message, image_data = await self._message_extractor.extract(body, msg_type)
         elapsed = (time.time() - start_time) * 1000
         logger.info(f"_extract_message 耗时: {elapsed:.2f}ms")
         if status_code != 0:
@@ -218,7 +268,7 @@ class WeComRAGFLOWBridge:
             msg= MessageBuilder.build_stream_message(
                req_id, uuid.uuid4().hex[:16],
                  f"消息解析失败,请联系我们：{user_message}")
-            await self._ws.send(json.dumps(msg))
+            await self.safe_ws_send(msg)
             return
 
         if not user_message and not image_data:
@@ -230,168 +280,41 @@ class WeComRAGFLOWBridge:
            msg= MessageBuilder.build_stream_message(
                req_id, uuid.uuid4().hex[:16],
                  f"通过图片解析,您提问的问题是：{user_message}")
-           await self._ws.send(json.dumps(msg))
+           await self.safe_ws_send(msg)
 
         if user_message.strip() == "#reset":
-            old_conv = self._sessions.clear_conversation(chat_id)
-            logger.info(f"用户请求新对话: chat={chat_id}, 清除旧会话={old_conv}")
+            conv_key = f"{chat_id}:{user_id}"
+            old_conv = self._sessions.clear_conversation(conv_key)
+            logger.info(f"用户请求新对话: chat={conv_key}, 清除旧会话={old_conv}")
             msg = MessageBuilder.build_stream_message(
                 req_id, uuid.uuid4().hex[:16],
                 "✅ 已开启新对话，之前的聊天记录已清除。请开始新的提问吧！",
                 finish=True
             )
-            await self._ws.send(json.dumps(msg))
+            await self.safe_ws_send(msg)
             return
 
+        total_start = time.time()
         try:
             if self._config.stream_mode:
-                await self._reply_stream(req_id, chat_id, user_message, image_data)
+                await self._reply_stream(req_id, chat_id, user_id, user_message, image_data)
             else:
                 await self._reply_blocking(req_id, chat_id, user_id, user_message, image_data)
+
+            total_elapsed = (time.time() - total_start) * 1000
+            logger.info(f"消息处理完成，总耗时: {total_elapsed:.2f}ms")
+            total_msg = MessageBuilder.build_stream_message(
+                req_id, uuid.uuid4().hex[:16],
+                f"\n\n⏱️ 本次处理耗时: {total_elapsed:.0f}ms",
+                finish=True
+            )
+            await self.safe_ws_send(total_msg)
         except Exception as e:
             logger.error(f"回复消息失败: {e}", exc_info=True)
             msg = MessageBuilder.build_error(req_id)
-            await self._ws.send(json.dumps(msg))
+            await self.safe_ws_send(msg)
 
-    async def _decrypt_wecom_image(self, image_info: dict) -> Optional[tuple[str, bytes]]:
-        """解密企业微信机器人图片并保存到本地媒体目录
-
-        Returns:
-            (filename, image_data) 或 None（解密/保存失败时）
-        """
-        image_url = image_info.get("url")
-        aeskey = image_info.get("aeskey")
-        if not image_url or not aeskey:
-            logger.warning("图片信息缺少 url 或 aeskey")
-            return None
-        try:
-            # 下载加密图片
-            async with self._http_session.get(image_url) as resp:
-                if resp.status != 200:
-                    logger.error(f"下载加密图片失败: HTTP {resp.status}, URL: {image_url}")
-                    return None
-                cipher_data = await resp.read()
-            # 解密
-            aeskey = aeskey.replace("-", "+").replace("_", "/")
-            padding = 4 - len(aeskey) % 4
-            if padding != 4:
-                aeskey += "=" * padding
-            key = base64.b64decode(aeskey)
-            iv = key[:16]
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            #20260429 zhuzc _decrypt_wecom_image 修复Padding is incorrect 的错误,去掉unpad，直接返回解密数据，发现企业微信的加密图片并没有使用标准的 PKCS7 填充，而是直接在末尾添加了随机字节，所以无法使用 unpad 正确去除填充，改为直接返回解密后的数据，由 MinerU OCR 识别时再进行处理。
-            #image_data = unpad(cipher.decrypt(cipher_data), AES.block_size)
-            image_data = cipher.decrypt(cipher_data)          # 保存到本地媒体目录
-            from urllib.parse import urlparse
-            import os
-            import tempfile
-            from pathlib import Path
-            parsed = urlparse(image_url)
-            ext = os.path.splitext(parsed.path)[1] if parsed.path else ""
-            if not ext:
-                ext = ".jpeg"
-            if not ext.startswith("."):
-                ext = "." + ext
-            media_dir = os.environ.get("MEDIA_DIR", tempfile.gettempdir())
-            Path(media_dir).mkdir(parents=True, exist_ok=True)
-            filename = f"mineru_{os.urandom(8).hex()}{ext}"
-            local_path = os.path.join(media_dir, filename)
-            with open(local_path, "wb") as f:
-                f.write(image_data)
-
-            logger.info(f"解密并保存图片: {local_path}, 大小: {len(image_data)} bytes")
-            return local_path, image_data
-        except Exception as e:
-            logger.error(f"解密图片失败: {e}, URL: {image_url}")
-            return None
-
-    async def _cleanup_media_file(self, filename: str, max_age_days: int = 3) -> None:
-        """清理媒体目录中指定天数之前的临时文件
-
-        Args:
-            filename: 要清理的文件名
-            max_age_days: 仅清理超过此天数的文件，默认3天
-        """
-        import os
-        import tempfile
-        import time
-        media_dir = os.environ.get("MEDIA_DIR", tempfile.gettempdir())
-        local_path = os.path.join(media_dir, filename)
-        try:
-            if os.path.exists(local_path):
-                file_mtime = os.path.getmtime(local_path)
-                file_age_days = (time.time() - file_mtime) / 86400
-                if file_age_days >= max_age_days:
-                    os.remove(local_path)
-                    logger.debug(f"已清理过期临时文件: {local_path} (年龄: {file_age_days:.1f}天)")
-                else:
-                    logger.debug(f"临时文件未过期保留: {local_path} (年龄: {file_age_days:.1f}天)")
-        except Exception as e:
-            logger.warning(f"清理临时文件失败: {e}")
-
-    async def _ocr_image(self, image_info: dict) -> Optional[str]:
-        """使用 MinerU OCR 识别图片内容（支持加密图片）"""
-        if not self._mineru:
-            return None
-        try:
-            image_url = image_info.get("url", "")
-          
-            # file 模式：解密后直接传二进制数据给 MinerU
-            result = await self._decrypt_wecom_image(image_info)
-            if not result:
-                logger.error("图片解密失败，无法进行 OCR")
-                return None
-            filename, image_data = result   #filename包含全文件路径
-            try:
-                logger.info(f"开始 OCR 识别图片, 方式: file, 大小: {len(image_data)} bytes")
-                text = await self._mineru.ocr(image_url, image_data, filename)
-            finally:
-                await self._cleanup_media_file(filename)
-            
-            logger.info(f"OCR 识别完成，提取文字长度: {len(text) if text else 0}")
-            return text if text and text.strip() else None
-        except Exception as e:
-            logger.error(f"OCR 识别失败: {e}")
-            return None
-
-    async def _extract_message(self, body: dict, msg_type: str) -> tuple[int, str, Optional[bytes]]:
-        """提取用户消息文本和图片数据（图片会通过 MinerU OCR 识别）
-        返回 (状态码, 消息文本, 图片数据)
-        状态码: 0=成功, 1=失败
-        """
-        if msg_type == "text":
-            return 0, body.get("text", {}).get("content", "").strip(), None
-        if msg_type == "mixed":
-            items = body.get("mixed", {}).get("msg_item", [])
-            texts = []
-            image_info = None
-            for item in items:
-                item_type = item.get("msgtype", "")
-                if item_type == "text":
-                    content = item.get("text", {}).get("content", "")
-                    if content:
-                        texts.append(content)
-                elif item_type == "image" :
-                    image_info = item.get("image", {})
-                    if image_info:
-                        ocr_text = await self._ocr_image(image_info)
-                        if ocr_text:
-                            texts.append(f"{ocr_text}")
-            return 0, " ".join(texts).strip(), None
-        if msg_type == "voice":
-            return 1, "[语音消息] 暂不支持语音识别，请发送文字消息。", None
-        if msg_type == "image":
-            image_info = body.get("image", {})
-            if image_info.get("url"):
-                ocr_text = await self._ocr_image(image_info)
-                if ocr_text:
-                    return 0, ocr_text, None
-            return 1, "[图片消息] OCR 识别失败", None
-        if msg_type == "file":
-            return 1, "[文件消息]", None
-        return 1, "", None
-
-    async def _reply_stream(self, req_id: str, chat_id: str, message: str, image_data: Optional[bytes] = None):
+    async def _reply_stream(self, req_id: str, chat_id: str, user_id: str, message: str, image_data: Optional[bytes] = None):
         """流式回复"""
         stream_id = uuid.uuid4().hex[:16]
         accumulated_text = ""
@@ -399,36 +322,40 @@ class WeComRAGFLOWBridge:
 
         # 启动等待动画
         animation_task = asyncio.create_task(animate_waiting(self._ws, req_id, stream_id))
-        msg = MessageBuilder.build_waiting(req_id, stream_id, "正在思考...")
-        await self._ws.send(json.dumps(msg))
+        #msg = MessageBuilder.build_waiting(req_id, stream_id, "正在思考...")
+        #await self._ws.send(json.dumps(msg))
 
         try:
-            async for event_data in self._ragflow.chat_stream(message, image_data):
-                if event_data == "[DONE]":
+            conv_key = f"{chat_id}:{user_id}"
+            conv_id = self._sessions.get_conversation_id(conv_key)
+            async for event_data in self._chat_client.chat_stream(message, image_data, conv_id, user_id):
+                if event_data.event == "done":
                     break
 
-                choices = event_data.get("choices", [])
-                if choices:
-                    content = choices[0].get("delta", {}).get("content", "")
-                    if content:
-                        accumulated_text += content
-                        chunk_count += 1
-                        if chunk_count == 1 or chunk_count % 5 == 0 or len(accumulated_text) > 20:
-                            msg = MessageBuilder.build_stream_message(req_id, stream_id, accumulated_text)
-                            await self._ws.send(json.dumps(msg))
+                if event_data.event == "message":
+                    content = event_data.content
+                    accumulated_text += content
+                    chunk_count += 1
+                    if chunk_count == 1 or chunk_count % 5 == 0 :
+                        if not animation_task.cancelled():
+                            animation_task.cancel()
+                        msg = MessageBuilder.build_stream_message(req_id, stream_id, accumulated_text)
+                        await self.safe_ws_send(msg)
+                        logger.info(f"发送流式消息: req_id={req_id}, chunk_count={chunk_count}, stream_id={stream_id}, 长度={len(accumulated_text)}")
 
-                elif event_data.get("event") == "message_end":
-                    new_conv_id = event_data.get("conversation_id")
-                    if new_conv_id:
-                        self._sessions.set_conversation_id(chat_id, new_conv_id)
-                        logger.debug(f"更新会话映射: {chat_id} -> {new_conv_id}")
+                elif event_data.event == "message_end":
+                    new_conv_id = event_data.conversation_id
+                    if new_conv_id != conv_id:
+                        self._sessions.set_conversation_id( conv_key, new_conv_id)
+                        logger.debug(f"更新会话映射: {conv_key} -> {new_conv_id}")
 
-                elif event_data.get("event") == "error":
-                    error_msg = event_data.get("message", "未知错误")
-                    logger.error(f"RAGFLOW 返回错误: {error_msg}")
+                elif event_data.event == "error":
+                    error_msg = event_data.error or "未知错误"
+                    logger.error(f"聊天后端返回错误: {error_msg}")
                     accumulated_text += f"\n\n[错误: {error_msg}]"
 
         finally:
+            
             animation_task.cancel()
             try:
                 await animation_task
@@ -437,21 +364,34 @@ class WeComRAGFLOWBridge:
 
         if not accumulated_text:
             accumulated_text = "流式处理未返回结果"
-
+            
+        if logger.level <= logging.DEBUG:
+            accumulated_text += f"\n本次回复字数：{len(accumulated_text)}"
         msg = MessageBuilder.build_stream_message(req_id, stream_id, accumulated_text, finish=True)
-        await self._ws.send(json.dumps(msg))
-        logger.info(f"流式回复完成: stream_id={stream_id}, 长度={len(accumulated_text)}")
+        await self.safe_ws_send(msg)
+        logger.info(f"流式回复完成: req_id={req_id}, stream_id={stream_id}, 长度={len(accumulated_text)}")
 
     async def _reply_blocking(self, req_id: str, chat_id: str, user_id: str, message: str, image_data: Optional[bytes] = None):
         """阻塞式回复"""
-        conv_id = self._sessions.get_conversation_id(chat_id)
-        answer, new_conv_id = await self._ragflow.chat_blocking(message, user_id, conv_id)
+        stream_id = uuid.uuid4().hex[:16]
+        animation_task = asyncio.create_task(animate_waiting(self._ws, req_id, stream_id))
+        conv_key = f"{chat_id}:{user_id}"
+        try:
+            conv_id = self._sessions.get_conversation_id(conv_key)
+            answer, new_conv_id = await self._chat_client.chat_blocking(message, user_id, conv_id, image_data)
 
-        if new_conv_id:
-            self._sessions.set_conversation_id(chat_id, new_conv_id)
+            if new_conv_id !=  conv_id:
+                logger.info(f"更新{conv_key}会话映射: {conv_id} -> {new_conv_id}")
+                self._sessions.set_conversation_id(conv_key, new_conv_id)
+        finally:
+            animation_task.cancel()
+            try:
+                await animation_task
+            except asyncio.CancelledError:
+                pass
 
-        msg = MessageBuilder.build_text_message(req_id, answer)
-        await self._ws.send(json.dumps(msg))
+        msg = MessageBuilder.build_stream_message(req_id, stream_id, answer, finish=True)
+        await self.safe_ws_send(msg)
         logger.info(f"阻塞式回复完成: 长度={len(answer)}")
 
 
@@ -465,9 +405,9 @@ async def main():
         sys.exit(1)
 
     logger.info("=" * 50)
-    logger.info("企业微信智能机器人 <-> RAGFLOW 桥接服务")
+    logger.info("企业微信智能机器人 <-> 聊天后端 桥接服务")
     logger.info(f"  BotID:     {config.wecom_bot_id[:8]}...")
-    logger.info(f"  RAGFLOW API:  {config.ragflow_api_base}")
+    logger.info(f"  聊天后端:  {config.chat_provider}")
     logger.info(f"  流式模式:  {'开启' if config.stream_mode else '关闭'}")
     logger.info(f"  心跳间隔:  {config.heartbeat_interval}s")
     logger.info("=" * 50)

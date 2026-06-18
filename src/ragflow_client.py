@@ -3,9 +3,11 @@
 import base64
 import json
 import logging
-from typing import Optional, AsyncIterator, Union
+from typing import Optional, AsyncIterator
 
 import aiohttp
+
+from chat_client import ChatStreamEvent
 
 logger = logging.getLogger("wecom-RAGFLOW-bridge")
 
@@ -51,8 +53,10 @@ class RAGFLOWClient:
     async def chat_stream(
         self,
         message: str,
-        image_data: Optional[bytes] = None
-    ) -> AsyncIterator[dict]:
+        image_data: Optional[bytes] = None,
+        conversation_id: Optional[str] = None,
+        user_id: str = "default",
+    ) -> AsyncIterator[ChatStreamEvent]:
         """流式聊天请求，支持图片输入"""
         url = f"{self._base_url}/api/v1/agents_openai/{self._agent_id}/chat/completions"
         logger.info(f"流式请求url: {url}, 含图片: {image_data is not None}")
@@ -73,12 +77,31 @@ class RAGFLOWClient:
                 if not line.startswith("data:"):
                     continue
 
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    yield ChatStreamEvent(event="done")
+                    continue
+
                 try:
-                    event_data = json.loads(line[5:].strip())
+                    event_data = json.loads(data)
                 except json.JSONDecodeError:
                     continue
 
-                yield event_data
+                choices = event_data.get("choices", [])
+                if choices:
+                    content = choices[0].get("delta", {}).get("content", "")
+                    if content:
+                        yield ChatStreamEvent(event="message", content=content)
+                elif event_data.get("event") == "message_end":
+                    yield ChatStreamEvent(
+                        event="message_end",
+                        conversation_id=event_data.get("conversation_id"),
+                    )
+                elif event_data.get("event") == "error":
+                    yield ChatStreamEvent(
+                        event="error",
+                        error=event_data.get("message", "未知错误"),
+                    )
 
     async def chat_blocking(
         self,

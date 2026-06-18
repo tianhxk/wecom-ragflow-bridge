@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 from typing import Optional
 
 import aiohttp
@@ -48,8 +47,9 @@ class MinerUClient:
         await self._upload_to_oss(file_url, filename,image_data)
         logger.info(f"上传完成: {filename}")
         # 轮询任务状态并获取 markdown_url
-        return await self._poll_task_result(task_id, timeout)
+        result = await self._poll_task_result(task_id, timeout)
         logger.info(f"解析任务完成: {task_id}")
+        return result
         
     async def _get_upload_url(self, local_filename: str) -> tuple[str, str]:
         """调用 api/v1/agent/parse/file 获取 task_id 和上传签名 URL"""
@@ -84,11 +84,6 @@ class MinerUClient:
                 error_text = await put_resp.text()
                 raise MinerUError(f"MinerU 文件上传到 OSS 失败:URL: {file_url}, HTTP {put_resp.status}, 响应: {error_text}")
     
-    def _cleanup_temp_file(self, local_path: str) -> None:
-        """清理临时文件"""
-        if os.path.exists(local_path):
-            os.remove(local_path)
-
     async def ocr_image_batch(self, image_url: str, timeout: int = 120) -> str:
         """通过图片 URL 进行 OCR 识别(v4/batch 方式)
 
@@ -126,24 +121,7 @@ class MinerUClient:
 
     async def ocr_image_bytes(self, image_data: bytes, filename: str = "image.jpg", timeout: int = 120) -> str:
         """通过图片二进制数据进行 OCR 识别,返回提取的文本"""
-        # 第一步:获取签名上传 URL
-        upload_url = f"{self._api_base}/api/v1/agent/parse/file"
-        payload = {
-            "file_name": filename,
-            "language": "ch",
-            "is_ocr": True
-        }
-
-        async with self._session.post(upload_url, json=payload, headers=self._json_headers()) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise MinerUError(f"MinerU 获取上传URL失败: {resp.status}: {error_text[:500]}")
-
-            upload_result = await resp.json()
-            task_id = upload_result.get("data", {}).get("task_id")
-            file_url = upload_result.get("data", {}).get("file_url")
-            if not task_id or not file_url:
-                raise MinerUError(f"MinerU 未返回 task_id 或 file_url: {upload_result}")
+        task_id, file_url = await self._get_upload_url(filename)
 
         # 第二步:PUT 上传文件到 OSS(file_url 已包含签名,直接上传即可)
         headers = {"Content-Type": "application/octet-stream"}

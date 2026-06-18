@@ -3,11 +3,13 @@ version: "3.8"
 services:
   wecom-RAGFLOW-bridge:
     build: .
-    container_name: wecom-ragflow-bridge
+    container_name: wecom-dify-bridge
     image: wecom-ragflow-bridge:latest
     #restart: unless-stopped
     volumes:
       - ./.config:/opt/app/config  # 将本地 config 目录挂载到容器内
+    ports:
+      - "8090:8090"  # 微信客服 webhook 回调入口
     # 连接到 RAGFLOW 的 Docker 网络，以便通过内部网络访问 RAGFLOW API
     networks:
       - ragflow-network
