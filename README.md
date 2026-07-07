@@ -1,5 +1,7 @@
 # WeCom-RAGFLOW-Bridge
 
+当前正式版本：**1.0**。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 企业微信智能机器人 ↔ RAGFLOW 桥接服务。
 本服务基于https://github.com/ApakohZzz/wecom-dify-bridge 的基础上做的RagFlow 桥接服务的改造，感谢大佬的支持
 通过 **WebSocket 长连接** 方式对接企业微信智能机器人，将用户消息转发到 RAGFLOW 应用，并将 AI 回复实时返回给用户。
@@ -86,6 +88,8 @@ cp .env.example .env
 | `STREAM_MODE` | ❌ | 流式回复开关 | 默认 `true` |
 | `HEARTBEAT_INTERVAL` | ❌ | 心跳间隔（秒） | 默认 `30` |
 | `LOG_LEVEL` | ❌ | 日志级别 | 默认 `INFO` |
+| `LOG_FILE` | ❌ | 文件日志路径 | 默认 `logs/wecom-ragflow-bridge.log` |
+| `LOG_RETENTION_DAYS` | ❌ | 日志保留天数，每天午夜轮转 | 默认 `30` |
 
 ### 3. 启动服务
 
@@ -93,10 +97,25 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+默认同时生成固定版本和最新版标签：
+
+- `wecom-ragflow-bridge:1.0` 与 `wecom-ragflow-bridge:latest`
+- `wecom-workbot-query-ui:1.0` 与 `wecom-workbot-query-ui:latest`
+
+同一组内的两个标签指向相同镜像，容器固定使用 `:1.0`。如需覆盖构建版本，可在
+执行 Compose 前设置 `APP_VERSION` 环境变量。
+
 ### 4. 查看日志
 
 ```bash
 docker compose logs -f
+```
+
+日志会同时写入宿主机的 `./logs/wecom-ragflow-bridge.log`，每天午夜自动轮转为
+`wecom-ragflow-bridge.log.YYYY-MM-DD`，只保留最近 30 天；也可以直接跟踪当前文件：
+
+```bash
+tail -f logs/wecom-ragflow-bridge.log
 ```
 
 看到以下输出说明连接成功：
@@ -143,6 +162,30 @@ WECOM_KF_ENABLED=true
 ```
 
 当前微信客服通道已支持文字消息与 `#reset`，图片和语音会提示用户改发文字。
+
+## WorkBot 消息查询 API
+
+设置 `WORKBOT_QUERY_API_TOKEN` 后，会在现有 webhook 端口启用两个只读接口：
+
+- `GET /api/workbot/messages`：查询 `message` 表。
+- `GET /api/workbot/callback-logs`：查询 `callback_log` 表。
+- `GET /api/workbot/logs`：列出当前日志和按天轮转的历史日志。
+- `GET /api/workbot/logs/{filename}/content`：浏览日志尾部内容。
+- `GET /api/workbot/logs/{filename}/download`：下载原始日志文件。
+
+请求需使用 `Authorization: Bearer <token>`，并必须提供 `robotid`、`start_time`、
+`end_time` 三个查询参数。默认每次返回 100 条、最多 200 条，单次时间范围不超过
+31 天。完整参数、分页方法和 curl 示例见 `src/对接WorkBot.md`。
+
+仓库同时包含 Vue 3 可视化查询界面。执行 `docker compose up -d --build` 后访问：
+
+```text
+http://服务器地址:8091
+```
+
+前端由 Nginx 独立提供服务，并在容器网络内把 `/api/workbot/*` 转发到 Python
+查询 API。界面中的“服务日志”数据源支持浏览和下载日志；开发方式见
+`frontend/README.md`。
 
 ## 网络说明
 

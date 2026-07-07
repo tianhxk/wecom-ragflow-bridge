@@ -10,10 +10,9 @@ services:
         - wecom-ragflow-bridge:latest
     container_name: wecom-dify-bridge
     image: wecom-ragflow-bridge:${APP_VERSION:-1.0}
-    #restart: unless-stopped
     environment:
-      - TZ=Asia/Shanghai
       - APP_VERSION=${APP_VERSION:-1.0}
+    restart: unless-stopped
     volumes:
       - ./.config:/opt/app/config  # 将本地 config 目录挂载到容器内
       - ./logs:/opt/app/logs  # 将文件日志持久化到宿主机

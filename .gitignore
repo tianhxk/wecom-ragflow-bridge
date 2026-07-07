@@ -4,6 +4,9 @@ __pycache__/
 .idea/
 .vscode/
 config/
+/logs/
+frontend/node_modules/
+frontend/dist/
 src/__pycache__/config.cpython-313.pyc
 src/__pycache__/ragflow_client.cpython-313.pyc
 src/__pycache__/config.cpython-313.pyc

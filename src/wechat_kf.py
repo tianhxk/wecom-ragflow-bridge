@@ -23,6 +23,15 @@ from session import SessionManager
 
 logger = logging.getLogger("wechat-kf")
 
+
+class DebugAccessLogger(web.AccessLogger):
+    @property
+    def enabled(self) -> bool:
+        return self.logger.isEnabledFor(logging.DEBUG)
+
+    def log(self, request, response, time) -> None:
+        self.logger.debug(self._format_line(request, response, time))
+
 WECOM_CALLBACK_PKCS7_BLOCK_SIZE = 32
 MAX_SEEN_MSGIDS = 5000
 DEFAULT_MAX_TEXT_MESSAGE_BYTES = 1500
@@ -184,6 +193,7 @@ class WeChatKFBridge:
         self._open_kfid = open_kfid
         self._cursors: dict[str, str] = {}
         self._running = False
+        self._stop_event = asyncio.Event()
         self._seen_msgids: set[str] = set()
         self._seen_msgids_order: list[str] = []
         self._processing_msgids: set[str] = set()
@@ -202,12 +212,20 @@ class WeChatKFBridge:
         self._sync_tasks: set[asyncio.Task] = set()
         self._load_state()
 
+    def add_routes(self, app: web.Application) -> None:
+        app.router.add_get(self._webhook_path, self._handle_verify)
+        app.router.add_post(self._webhook_path, self._handle_callback)
+
+    async def run_forever(self) -> None:
+        self._running = True
+        self._stop_event.clear()
+        await self._stop_event.wait()
+
     async def start(self) -> None:
         self._running = True
         self._app = web.Application()
-        self._app.router.add_get(self._webhook_path, self._handle_verify)
-        self._app.router.add_post(self._webhook_path, self._handle_callback)
-        self._runner = web.AppRunner(self._app)
+        self.add_routes(self._app)
+        self._runner = web.AppRunner(self._app, access_log_class=DebugAccessLogger)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self._webhook_host, self._webhook_port)
         await self._site.start()
@@ -218,11 +236,11 @@ class WeChatKFBridge:
             self._webhook_path,
             self._open_kfid or "all",
         )
-        while self._running:
-            await asyncio.sleep(3600)
+        await self.run_forever()
 
     async def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
         for task in list(self._sync_tasks):
             task.cancel()
         if self._sync_tasks:
